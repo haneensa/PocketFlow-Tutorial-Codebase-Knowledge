@@ -2,7 +2,7 @@ import os
 import re
 import yaml
 from pocketflow import Node, BatchNode
-from utils.crawl_github_files import crawl_github_files
+from cli_config import set_llm_runtime_config
 from utils.call_llm import call_llm
 from utils.crawl_local_files import crawl_local_files
 
@@ -19,18 +19,25 @@ def get_content_for_indices(files_data, indices):
     return content_map
 
 
+def extract_yaml_text(response: str) -> str:
+    """
+    Accept both fenced YAML (```yaml ... ```) and plain YAML responses.
+    """
+    text = response.strip()
+    if "```yaml" in text:
+        return text.split("```yaml", 1)[1].split("```", 1)[0].strip()
+    if text.startswith("```") and text.endswith("```"):
+        return text.split("```", 1)[1].rsplit("```", 1)[0].strip()
+    return text
+
+
 class FetchRepo(Node):
     def prep(self, shared):
-        repo_url = shared.get("repo_url")
         local_dir = shared.get("local_dir")
         project_name = shared.get("project_name")
 
         if not project_name:
-            # Basic name derivation from URL or directory
-            if repo_url:
-                project_name = repo_url.split("/")[-1].replace(".git", "")
-            else:
-                project_name = os.path.basename(os.path.abspath(local_dir))
+            project_name = os.path.basename(os.path.abspath(local_dir))
             shared["project_name"] = project_name
 
         # Get file patterns directly from shared
@@ -39,9 +46,7 @@ class FetchRepo(Node):
         max_file_size = shared["max_file_size"]
 
         return {
-            "repo_url": repo_url,
             "local_dir": local_dir,
-            "token": shared.get("github_token"),
             "include_patterns": include_patterns,
             "exclude_patterns": exclude_patterns,
             "max_file_size": max_file_size,
@@ -49,26 +54,14 @@ class FetchRepo(Node):
         }
 
     def exec(self, prep_res):
-        if prep_res["repo_url"]:
-            print(f"Crawling repository: {prep_res['repo_url']}...")
-            result = crawl_github_files(
-                repo_url=prep_res["repo_url"],
-                token=prep_res["token"],
-                include_patterns=prep_res["include_patterns"],
-                exclude_patterns=prep_res["exclude_patterns"],
-                max_file_size=prep_res["max_file_size"],
-                use_relative_paths=prep_res["use_relative_paths"],
-            )
-        else:
-            print(f"Crawling directory: {prep_res['local_dir']}...")
-
-            result = crawl_local_files(
-                directory=prep_res["local_dir"],
-                include_patterns=prep_res["include_patterns"],
-                exclude_patterns=prep_res["exclude_patterns"],
-                max_file_size=prep_res["max_file_size"],
-                use_relative_paths=prep_res["use_relative_paths"]
-            )
+        print(f"Crawling directory: {prep_res['local_dir']}...")
+        result = crawl_local_files(
+            directory=prep_res["local_dir"],
+            include_patterns=prep_res["include_patterns"],
+            exclude_patterns=prep_res["exclude_patterns"],
+            max_file_size=prep_res["max_file_size"],
+            use_relative_paths=prep_res["use_relative_paths"]
+        )
 
         # Convert dict to list of tuples: [(path, content), ...]
         files_list = list(result.get("files", {}).items())
@@ -81,6 +74,145 @@ class FetchRepo(Node):
         shared["files"] = exec_res  # List of (path, content) tuples
 
 
+class RunConfig(Node):
+    def prep(self, shared):
+        return {
+            "config_path": shared.get("config_path", "configure_args.yaml"),
+            "local_dir": shared.get("local_dir"),
+            "project_name": shared.get("project_name"),
+            "include_patterns": shared.get("include_patterns", set()),
+            "exclude_patterns": shared.get("exclude_patterns", set()),
+            "output_dir": shared.get("output_dir", "output"),
+            "language": shared.get("language", "english"),
+            "max_file_size": shared.get("max_file_size", 100000),
+            "use_cache": shared.get("use_cache", True),
+            "max_abstraction_num": shared.get("max_abstraction_num", 10),
+            "llm_require_consent": shared.get("llm_require_consent", False),
+            "llm_show_prompt": shared.get("llm_show_prompt", False),
+            "log_dir": shared.get("log_dir", "workspace/logs"),
+            "llm_cache_file": shared.get("llm_cache_file", "workspace/cache/llm_cache.json"),
+            "llm_manual_dir": shared.get("llm_manual_dir", "workspace/llm"),
+            "llm_manual_poll_interval_s": shared.get("llm_manual_poll_interval_s", 2.0),
+            "llm_manual_timeout_s": shared.get("llm_manual_timeout_s", 0),
+            "llm_redact_logs": shared.get("llm_redact_logs", True),
+        }
+
+    def exec(self, prep_res):
+        config_path = prep_res["config_path"]
+        if not os.path.exists(config_path):
+            raise RuntimeError(
+                f"Config file not found: {config_path}. "
+                "Create it before running."
+            )
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        if not isinstance(cfg, dict):
+            raise RuntimeError("Config YAML must be a mapping/dictionary.")
+
+        raw_yaml_text = yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True)
+        print("")
+        print("Current YAML content:")
+        print(raw_yaml_text.rstrip() if raw_yaml_text.strip() else "(empty)")
+
+        local_dir = str(cfg.get("local_dir", prep_res["local_dir"] or "")).strip()
+        project_name = str(cfg.get("project_name", prep_res["project_name"] or "")).strip() or None
+        include_patterns = cfg.get("include_patterns", sorted(prep_res["include_patterns"]))
+        exclude_patterns = cfg.get("exclude_patterns", sorted(prep_res["exclude_patterns"]))
+
+        errors = []
+        if not local_dir:
+            errors.append("local_dir is required.")
+        if not isinstance(include_patterns, list) or len(include_patterns) == 0:
+            errors.append("include_patterns must be a non-empty list.")
+        if not isinstance(exclude_patterns, list) or len(exclude_patterns) == 0:
+            errors.append("exclude_patterns must be a non-empty list.")
+        if errors:
+            raise RuntimeError("Invalid config YAML:\n- " + "\n- ".join(errors))
+
+        resolved = {
+            "config_path": config_path,
+            "local_dir": local_dir,
+            "project_name": project_name,
+            "include_patterns": set(include_patterns),
+            "exclude_patterns": set(exclude_patterns),
+            "output_dir": cfg.get("output_dir", prep_res["output_dir"]),
+            "language": cfg.get("language", prep_res["language"]),
+            "max_file_size": int(cfg.get("max_file_size", prep_res["max_file_size"])),
+            "use_cache": bool(cfg.get("use_cache", prep_res["use_cache"])),
+            "max_abstraction_num": int(cfg.get("max_abstraction_num", prep_res["max_abstraction_num"])),
+            "llm_require_consent": bool(cfg.get("llm_require_consent", prep_res["llm_require_consent"])),
+            "llm_show_prompt": bool(cfg.get("llm_show_prompt", prep_res["llm_show_prompt"])),
+            "log_dir": str(cfg.get("log_dir", prep_res["log_dir"])),
+            "llm_cache_file": str(cfg.get("llm_cache_file", prep_res["llm_cache_file"])),
+            "llm_manual_dir": str(cfg.get("llm_manual_dir", prep_res["llm_manual_dir"])),
+            "llm_manual_poll_interval_s": float(
+                cfg.get("llm_manual_poll_interval_s", prep_res["llm_manual_poll_interval_s"])
+            ),
+            "llm_manual_timeout_s": int(cfg.get("llm_manual_timeout_s", prep_res["llm_manual_timeout_s"])),
+            "llm_redact_logs": bool(cfg.get("llm_redact_logs", prep_res["llm_redact_logs"])),
+        }
+
+        print("")
+        print("Final run configuration:")
+        print(f"- config_path: {resolved['config_path']}")
+        print(f"- local_dir: {resolved['local_dir']}")
+        print(f"- project_name: {resolved['project_name'] or '(auto)'}")
+        print(f"- include_patterns: {sorted(resolved['include_patterns'])}")
+        print(f"- exclude_patterns: {sorted(resolved['exclude_patterns'])}")
+        print(f"- output_dir: {resolved['output_dir']}")
+        print(f"- language: {resolved['language']}")
+        print(f"- max_file_size: {resolved['max_file_size']}")
+        print(f"- use_cache: {resolved['use_cache']}")
+        print(f"- max_abstraction_num: {resolved['max_abstraction_num']}")
+        print(f"- llm_require_consent: {resolved['llm_require_consent']}")
+        print(f"- llm_show_prompt: {resolved['llm_show_prompt']}")
+        print(f"- log_dir: {resolved['log_dir']}")
+        print(f"- llm_cache_file: {resolved['llm_cache_file']}")
+        print(f"- llm_manual_dir: {resolved['llm_manual_dir']}")
+        print(f"- llm_manual_poll_interval_s: {resolved['llm_manual_poll_interval_s']}")
+        print(f"- llm_manual_timeout_s: {resolved['llm_manual_timeout_s']}")
+        print(f"- llm_redact_logs: {resolved['llm_redact_logs']}")
+        print("")
+
+        while True:
+            reply = input("Start tutorial generation with this config? [y]es/[n]o: ").strip().lower()
+            if reply in {"y", "yes", ""}:
+                return {"approved": True, "config": resolved}
+            if reply in {"n", "no"}:
+                raise RuntimeError("Run cancelled by user at RunConfig step.")
+            print("Please answer with 'y' or 'n'.")
+
+    def post(self, shared, prep_res, exec_res):
+        if not exec_res.get("approved"):
+            raise RuntimeError("Run configuration not approved.")
+        cfg = exec_res["config"]
+        shared["config_path"] = cfg["config_path"]
+        shared["local_dir"] = cfg["local_dir"]
+        if cfg.get("project_name"):
+            shared["project_name"] = cfg["project_name"]
+        shared["include_patterns"] = cfg["include_patterns"]
+        shared["exclude_patterns"] = cfg["exclude_patterns"]
+        shared["output_dir"] = cfg["output_dir"]
+        shared["language"] = cfg["language"]
+        shared["max_file_size"] = cfg["max_file_size"]
+        shared["use_cache"] = cfg["use_cache"]
+        shared["max_abstraction_num"] = cfg["max_abstraction_num"]
+        shared["llm_require_consent"] = cfg["llm_require_consent"]
+        shared["llm_show_prompt"] = cfg["llm_show_prompt"]
+        shared["log_dir"] = cfg["log_dir"]
+        shared["llm_cache_file"] = cfg["llm_cache_file"]
+        shared["llm_manual_dir"] = cfg["llm_manual_dir"]
+        shared["llm_manual_poll_interval_s"] = cfg["llm_manual_poll_interval_s"]
+        shared["llm_manual_timeout_s"] = cfg["llm_manual_timeout_s"]
+        shared["llm_redact_logs"] = cfg["llm_redact_logs"]
+        set_llm_runtime_config(shared)
+        print(f"Configured directory: {shared['local_dir']}")
+        print(f"Configured include patterns: {sorted(shared['include_patterns'])}")
+        print(f"Configured exclude patterns: {sorted(shared['exclude_patterns'])}")
+
+
 class IdentifyAbstractions(Node):
     def prep(self, shared):
         files_data = shared["files"]
@@ -88,6 +220,8 @@ class IdentifyAbstractions(Node):
         language = shared.get("language", "english")  # Get language
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
         max_abstraction_num = shared.get("max_abstraction_num", 10)  # Get max_abstraction_num, default to 10
+        llm_require_consent = shared.get("llm_require_consent", False)
+        llm_show_prompt = shared.get("llm_show_prompt", False)
 
         # Helper to create context from files, respecting limits (basic example)
         def create_llm_context(files_data):
@@ -113,6 +247,8 @@ class IdentifyAbstractions(Node):
             language,
             use_cache,
             max_abstraction_num,
+            llm_require_consent,
+            llm_show_prompt,
         )  # Return all parameters
 
     def exec(self, prep_res):
@@ -124,6 +260,8 @@ class IdentifyAbstractions(Node):
             language,
             use_cache,
             max_abstraction_num,
+            llm_require_consent,
+            llm_show_prompt,
         ) = prep_res  # Unpack all parameters
         print(f"Identifying abstractions using LLM...")
 
@@ -173,10 +311,17 @@ Format the output as a YAML list of dictionaries:
     - 5 # path/to/another.js
 # ... up to {max_abstraction_num} abstractions
 ```"""
-        response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))  # Use cache only if enabled and not retrying
+        response = call_llm(
+            prompt,
+            use_cache=(use_cache and self.cur_retry == 0),
+            request_tag="identify_abstractions",
+            project_name=project_name,
+            llm_require_consent=llm_require_consent,
+            llm_show_prompt=llm_show_prompt,
+        )  # Use cache only if enabled and not retrying
 
         # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+        yaml_str = extract_yaml_text(response)
         abstractions = yaml.safe_load(yaml_str)
 
         if not isinstance(abstractions, list):
@@ -246,6 +391,8 @@ class AnalyzeRelationships(Node):
         project_name = shared["project_name"]  # Get project name
         language = shared.get("language", "english")  # Get language
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
+        llm_require_consent = shared.get("llm_require_consent", False)
+        llm_show_prompt = shared.get("llm_show_prompt", False)
 
         # Get the actual number of abstractions directly
         num_abstractions = len(abstractions)
@@ -284,6 +431,8 @@ class AnalyzeRelationships(Node):
             project_name,
             language,
             use_cache,
+            llm_require_consent,
+            llm_show_prompt,
         )  # Return use_cache
 
     def exec(self, prep_res):
@@ -294,6 +443,8 @@ class AnalyzeRelationships(Node):
             project_name,
             language,
             use_cache,
+            llm_require_consent,
+            llm_show_prompt,
          ) = prep_res  # Unpack use_cache
         print(f"Analyzing relationships using LLM...")
 
@@ -344,10 +495,17 @@ relationships:
 
 Now, provide the YAML output:
 """
-        response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0)) # Use cache only if enabled and not retrying
+        response = call_llm(
+            prompt,
+            use_cache=(use_cache and self.cur_retry == 0),
+            request_tag="analyze_relationships",
+            project_name=project_name,
+            llm_require_consent=llm_require_consent,
+            llm_show_prompt=llm_show_prompt,
+        ) # Use cache only if enabled and not retrying
 
         # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+        yaml_str = extract_yaml_text(response)
         relationships_data = yaml.safe_load(yaml_str)
 
         if not isinstance(relationships_data, dict) or not all(
@@ -414,6 +572,8 @@ class OrderChapters(Node):
         project_name = shared["project_name"]  # Get project name
         language = shared.get("language", "english")  # Get language
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
+        llm_require_consent = shared.get("llm_require_consent", False)
+        llm_show_prompt = shared.get("llm_show_prompt", False)
 
         # Prepare context for the LLM
         abstraction_info_for_prompt = []
@@ -449,6 +609,8 @@ class OrderChapters(Node):
             project_name,
             list_lang_note,
             use_cache,
+            llm_require_consent,
+            llm_show_prompt,
         )  # Return use_cache
 
     def exec(self, prep_res):
@@ -459,6 +621,8 @@ class OrderChapters(Node):
             project_name,
             list_lang_note,
             use_cache,
+            llm_require_consent,
+            llm_show_prompt,
         ) = prep_res  # Unpack use_cache
         print("Determining chapter order using LLM...")
         # No language variation needed here in prompt instructions, just ordering based on structure
@@ -486,10 +650,17 @@ Output the ordered list of abstraction indices, including the name in a comment 
 
 Now, provide the YAML output:
 """
-        response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0)) # Use cache only if enabled and not retrying
+        response = call_llm(
+            prompt,
+            use_cache=(use_cache and self.cur_retry == 0),
+            request_tag="order_chapters",
+            project_name=project_name,
+            llm_require_consent=llm_require_consent,
+            llm_show_prompt=llm_show_prompt,
+        ) # Use cache only if enabled and not retrying
 
         # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+        yaml_str = extract_yaml_text(response)
         ordered_indices_raw = yaml.safe_load(yaml_str)
 
         if not isinstance(ordered_indices_raw, list):
@@ -544,6 +715,8 @@ class WriteChapters(BatchNode):
         project_name = shared["project_name"]
         language = shared.get("language", "english")
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
+        llm_require_consent = shared.get("llm_require_consent", False)
+        llm_show_prompt = shared.get("llm_show_prompt", False)
 
         # Get already written chapters to provide context
         # We store them temporarily during the batch run, not in shared memory yet
@@ -616,6 +789,8 @@ class WriteChapters(BatchNode):
                         "next_chapter": next_chapter,  # Add next chapter info (uses potentially translated name)
                         "language": language,  # Add language for multi-language support
                         "use_cache": use_cache, # Pass use_cache flag
+                        "llm_require_consent": llm_require_consent,
+                        "llm_show_prompt": llm_show_prompt,
                         # previous_chapters_summary will be added dynamically in exec
                     }
                 )
@@ -639,6 +814,8 @@ class WriteChapters(BatchNode):
         project_name = item.get("project_name")
         language = item.get("language", "english")
         use_cache = item.get("use_cache", True) # Read use_cache from item
+        llm_require_consent = item.get("llm_require_consent", False)
+        llm_show_prompt = item.get("llm_show_prompt", False)
         print(f"Writing chapter {chapter_num} for: {abstraction_name} using LLM...")
 
         # Prepare file context string from the map
@@ -723,7 +900,14 @@ Instructions for the chapter (Generate content in {language.capitalize()} unless
 
 Now, directly provide a super beginner-friendly Markdown output (DON'T need ```markdown``` tags):
 """
-        chapter_content = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0)) # Use cache only if enabled and not retrying
+        chapter_content = call_llm(
+            prompt,
+            use_cache=(use_cache and self.cur_retry == 0),
+            request_tag=f"write_chapter_{chapter_num:02d}",
+            project_name=project_name,
+            llm_require_consent=llm_require_consent,
+            llm_show_prompt=llm_show_prompt,
+        ) # Use cache only if enabled and not retrying
         # Basic validation/cleanup
         actual_heading = f"# Chapter {chapter_num}: {abstraction_name}"  # Use potentially translated name
         if not chapter_content.strip().startswith(f"# Chapter {chapter_num}"):
@@ -755,7 +939,7 @@ class CombineTutorial(Node):
         project_name = shared["project_name"]
         output_base_dir = shared.get("output_dir", "output")  # Default output dir
         output_path = os.path.join(output_base_dir, project_name)
-        repo_url = shared.get("repo_url")  # Get the repository URL
+        local_dir = shared.get("local_dir")  # Get the local directory path
         # language = shared.get("language", "english") # No longer needed for fixed strings
 
         # Get potentially translated data
@@ -803,7 +987,7 @@ class CombineTutorial(Node):
         index_content = f"# Tutorial: {project_name}\n\n"
         index_content += f"{relationships_data['summary']}\n\n"  # Use the potentially translated summary directly
         # Keep fixed strings in English
-        index_content += f"**Source Repository:** [{repo_url}]({repo_url})\n\n"
+        index_content += f"**Source Directory:** `{local_dir}`\n\n"
 
         # Add Mermaid diagram for relationships (diagram itself uses potentially translated names/labels)
         index_content += "```mermaid\n"

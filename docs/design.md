@@ -13,11 +13,11 @@ nav_order: 2
 > Notes for AI: Keep it simple and clear.
 > If the requirements are abstract, write concrete user stories
 
-**User Story:** As a developer onboarding to a new codebase, I want a tutorial automatically generated from its GitHub repository or local directory, optionally in a specific language. This tutorial should explain the core abstractions, their relationships (visualized), and how they work together, using beginner-friendly language, analogies, and multi-line descriptions where needed, so I can understand the project structure and key concepts quickly without manually digging through all the code.
+**User Story:** As a developer onboarding to a new codebase, I want a tutorial automatically generated from a local directory, optionally in a specific language. This tutorial should explain the core abstractions, their relationships (visualized), and how they work together, using beginner-friendly language, analogies, and multi-line descriptions where needed, so I can understand the project structure and key concepts quickly without manually digging through all the code.
 
 **Input:**
-- A publicly accessible GitHub repository URL or a local directory path.
-- A project name (optional, will be derived from the URL/directory if not provided).
+- A local directory path.
+- A project name (optional, will be derived from the directory if not provided).
 - Desired language for the tutorial (optional, defaults to English).
 
 **Output:**
@@ -43,12 +43,12 @@ This project primarily uses a **Workflow** pattern to decompose the tutorial gen
 
 ### Flow high-level Design:
 
-1.  **`FetchRepo`**: Crawls the specified GitHub repository URL or local directory using appropriate utility (`crawl_github_files` or `crawl_local_files`), retrieving relevant source code file contents.
+1.  **`FetchRepo`**: Crawls the specified local directory using `crawl_local_files`, retrieving relevant source code file contents.
 2.  **`IdentifyAbstractions`**: Analyzes the codebase using an LLM to identify up to 10 core abstractions, generate beginner-friendly descriptions (potentially translated if language != English), and list the *indices* of files related to each abstraction.
 3.  **`AnalyzeRelationships`**: Uses an LLM to analyze the identified abstractions (referenced by index) and their related code to generate a high-level project summary and describe the relationships/interactions between these abstractions (summary and labels potentially translated if language != English), specifying *source* and *target* abstraction indices and a concise label for each interaction.
 4.  **`OrderChapters`**: Determines the most logical order (as indices) to present the abstractions in the tutorial, considering input context which might be translated. The output order itself is language-independent.
 5.  **`WriteChapters` (BatchNode)**: Iterates through the ordered list of abstraction indices. For each abstraction, it calls an LLM to write a detailed, beginner-friendly chapter (content potentially fully translated if language != English), using the relevant code files (accessed via indices) and summaries of previously generated chapters (potentially translated) as context.
-6.  **`CombineTutorial`**: Creates an output directory, generates a Mermaid diagram from the relationship data (using potentially translated names/labels), and writes the project summary (potentially translated), relationship diagram, chapter links (using potentially translated names), and individually generated chapter files (potentially translated content) into it. Fixed text like "Chapters", "Source Repository", and the attribution footer remain in English.
+6.  **`CombineTutorial`**: Creates an output directory, generates a Mermaid diagram from the relationship data (using potentially translated names/labels), and writes the project summary (potentially translated), relationship diagram, chapter links (using potentially translated names), and individually generated chapter files (potentially translated content) into it. Fixed text like "Chapters", "Source Directory", and the attribution footer remain in English.
 
 ```mermaid
 flowchart TD
@@ -65,15 +65,11 @@ flowchart TD
 > 1. Understand the utility function definition thoroughly by reviewing the doc.
 > 2. Include only the necessary utility functions, based on nodes in the flow.
 
-1.  **`crawl_github_files`** (`utils/crawl_github_files.py`) - *External Dependency: requests, gitpython (optional for SSH)*
-    *   *Input*: `repo_url` (str), `token` (str, optional), `max_file_size` (int, optional), `use_relative_paths` (bool, optional), `include_patterns` (set, optional), `exclude_patterns` (set, optional)
-    *   *Output*: `dict` containing `files` (dict[str, str]) and `stats`.
-    *   *Necessity*: Required by `FetchRepo` to download and read source code from GitHub if a `repo_url` is provided. Handles API calls or SSH cloning, filtering, and file reading.
-2.  **`crawl_local_files`** (`utils/crawl_local_files.py`) - *External Dependency: None*
+1.  **`crawl_local_files`** (`utils/crawl_local_files.py`) - *External Dependency: None*
     *   *Input*: `directory` (str), `max_file_size` (int, optional), `use_relative_paths` (bool, optional), `include_patterns` (set, optional), `exclude_patterns` (set, optional)
     *   *Output*: `dict` containing `files` (dict[str, str]).
     *   *Necessity*: Required by `FetchRepo` to read source code from a local directory if a `local_dir` path is provided. Handles directory walking, filtering, and file reading.
-3.  **`call_llm`** (`utils/call_llm.py`) - *External Dependency: LLM Provider API (e.g., Google GenAI)*
+2.  **`call_llm`** (`utils/call_llm.py`) - *External Dependency: LLM Provider API (e.g., Google GenAI)*
     *   *Input*: `prompt` (str), `use_cache` (bool, optional)
     *   *Output*: `response` (str)
     *   *Necessity*: Used by `IdentifyAbstractions`, `AnalyzeRelationships`, `OrderChapters`, and `WriteChapters` for code analysis and content generation. Needs careful prompt engineering and YAML validation (implicit via `yaml.safe_load` which raises errors).
@@ -89,10 +85,8 @@ The shared Store structure is organized as follows:
 ```python
 shared = {
     # --- Inputs ---
-    "repo_url": None, # Provided by the user/main script if using GitHub
     "local_dir": None, # Provided by the user/main script if using local directory
-    "project_name": None, # Optional, derived from repo_url/local_dir if not provided
-    "github_token": None, # Optional, from argument or environment variable
+    "project_name": None, # Optional, derived from local_dir if not provided
     "output_dir": "output", # Default or user-specified base directory for output
     "include_patterns": set(), # File patterns to include
     "exclude_patterns": set(), # File patterns to exclude
@@ -117,11 +111,11 @@ shared = {
 > Notes for AI: Carefully decide whether to use Batch/Async Node/Flow. Removed explicit try/except in exec, relying on Node's built-in fault tolerance.
 
 1.  **`FetchRepo`**
-    *   *Purpose*: Download the repository code (from GitHub) or read from a local directory, loading relevant files into memory using the appropriate crawler utility.
+    *   *Purpose*: Read repository code from a local directory, loading relevant files into memory using the local crawler utility.
     *   *Type*: Regular
     *   *Steps*:
-        *   `prep`: Read `repo_url`, `local_dir`, `project_name`, `github_token`, `output_dir`, `include_patterns`, `exclude_patterns`, `max_file_size` from shared store. Determine `project_name` from `repo_url` or `local_dir` if not present in shared. Set `use_relative_paths` flag.
-        *   `exec`: If `repo_url` is present, call `crawl_github_files(...)`. Otherwise, call `crawl_local_files(...)`. Convert the resulting `files` dictionary into a list of `(path, content)` tuples.
+        *   `prep`: Read `local_dir`, `project_name`, `output_dir`, `include_patterns`, `exclude_patterns`, `max_file_size` from shared store. Determine `project_name` from `local_dir` if not present in shared. Set `use_relative_paths` flag.
+        *   `exec`: Call `crawl_local_files(...)`. Convert the resulting `files` dictionary into a list of `(path, content)` tuples.
         *   `post`: Write the list of `files` tuples and the derived `project_name` (if applicable) to the shared store.
 
 2.  **`IdentifyAbstractions`**
@@ -160,6 +154,6 @@ shared = {
     *   *Purpose*: Assemble the final tutorial files, including a Mermaid diagram using potentially translated labels/names. Fixed text remains English.
     *   *Type*: Regular
     *   *Steps*:
-        *   `prep`: Read `project_name`, `relationships` (potentially translated summary/labels), `chapter_order` (indices), `abstractions` (potentially translated name/desc), `chapters` (list of potentially translated content), `repo_url`, and `output_dir` from shared store. Generate a Mermaid `flowchart TD` string based on `relationships["details"]`, using indices to identify nodes (potentially translated names) and the concise `label` (potentially translated) for edges. Construct the content for `index.md` (including potentially translated summary, Mermaid diagram, and ordered links to chapters using potentially translated names derived using `chapter_order` and `abstractions`). Define the output directory path (e.g., `./output_dir/project_name`). Prepare a list of `{ "filename": "01_...", "content": "..." }` for chapters, adding the English attribution footer to each chapter's content. Add the English attribution footer to the index content.
+        *   `prep`: Read `project_name`, `relationships` (potentially translated summary/labels), `chapter_order` (indices), `abstractions` (potentially translated name/desc), `chapters` (list of potentially translated content), `local_dir`, and `output_dir` from shared store. Generate a Mermaid `flowchart TD` string based on `relationships["details"]`, using indices to identify nodes (potentially translated names) and the concise `label` (potentially translated) for edges. Construct the content for `index.md` (including potentially translated summary, Mermaid diagram, and ordered links to chapters using potentially translated names derived using `chapter_order` and `abstractions`). Define the output directory path (e.g., `./output_dir/project_name`). Prepare a list of `{ "filename": "01_...", "content": "..." }` for chapters, adding the English attribution footer to each chapter's content. Add the English attribution footer to the index content.
         *   `exec`: Create the output directory. Write the generated `index.md` content. Iterate through the prepared chapter file list and write each chapter's content to its corresponding `.md` file in the output directory.
         *   `post`: Write the final `output_path` to `shared["final_output_dir"]`. Log completion.

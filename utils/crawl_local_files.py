@@ -11,7 +11,7 @@ def crawl_local_files(
     use_relative_paths=True,
 ):
     """
-    Crawl files in a local directory with similar interface as crawl_github_files.
+    Crawl files in a local directory.
     Args:
         directory (str): Path to local directory
         include_patterns (set): File patterns to include (e.g. {"*.py", "*.js"})
