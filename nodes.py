@@ -31,6 +31,31 @@ def extract_yaml_text(response: str) -> str:
     return text
 
 
+def normalize_project_display_path(project_name, file_path):
+    """
+    Build project-scoped display path: <project_name>/<relative/path>.
+    Reject paths that escape project root.
+    """
+    normalized = str(file_path).replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized or normalized == ".." or normalized.startswith("../"):
+        return None
+    return f"{project_name}/{normalized}"
+
+
+def extract_reference_indices(markdown_text):
+    """Extract ordered, de-duplicated [ref:<index>] citations from chapter text."""
+    seen = set()
+    ordered = []
+    for match in re.finditer(r"\[ref:(\d+)\]", markdown_text):
+        idx = int(match.group(1))
+        if idx not in seen:
+            ordered.append(idx)
+            seen.add(idx)
+    return ordered
+
+
 class FetchRepo(Node):
     def prep(self, shared):
         local_dir = shared.get("local_dir")
@@ -763,6 +788,20 @@ class WriteChapters(BatchNode):
                 related_files_content_map = get_content_for_indices(
                     files_data, related_file_indices
                 )
+                chapter_reference_allowlist = []
+                for file_idx in related_file_indices:
+                    if 0 <= file_idx < len(files_data):
+                        file_path = files_data[file_idx][0]
+                        display_path = normalize_project_display_path(
+                            project_name, file_path
+                        )
+                        if display_path:
+                            chapter_reference_allowlist.append(
+                                {
+                                    "index": file_idx,
+                                    "display_path": display_path,
+                                }
+                            )
 
                 # Get previous chapter info for transitions (uses potentially translated name)
                 prev_chapter = None
@@ -785,6 +824,7 @@ class WriteChapters(BatchNode):
                         "project_name": shared["project_name"],  # Add project name
                         "full_chapter_listing": full_chapter_listing,  # Add the full chapter listing (uses potentially translated names)
                         "chapter_filenames": chapter_filenames,  # Add chapter filenames mapping (uses potentially translated names)
+                        "chapter_reference_allowlist": chapter_reference_allowlist,
                         "prev_chapter": prev_chapter,  # Add previous chapter info (uses potentially translated name)
                         "next_chapter": next_chapter,  # Add next chapter info (uses potentially translated name)
                         "language": language,  # Add language for multi-language support
@@ -827,6 +867,12 @@ class WriteChapters(BatchNode):
         # Get summary of chapters written *before* this one
         # Use the temporary instance variable
         previous_chapters_summary = "\n---\n".join(self.chapters_written_so_far)
+        chapter_reference_allowlist = item.get("chapter_reference_allowlist", [])
+        min_required_refs = min(2, len(chapter_reference_allowlist))
+        allowed_refs_str = "\n".join(
+            f"- {ref_item['index']} # {ref_item['display_path']}"
+            for ref_item in chapter_reference_allowlist
+        )
 
         # Add language instruction and context notes only if not English
         language_instruction = ""
@@ -886,6 +932,13 @@ Instructions for the chapter (Generate content in {language.capitalize()} unless
 
 - Then dive deeper into code for the internal implementation with references to files. Provide example code blocks, but make them similarly simple and beginner-friendly. Explain{instruction_lang_note}.
 
+- Allowed code references for this chapter:
+{allowed_refs_str if allowed_refs_str else "- None available for this chapter."}
+
+- When referencing code-backed claims, cite files using tokens like `[ref:12]` where `12` is a valid allowed index from the list above. If references are available, include at least {min_required_refs} citations.
+
+- NEVER output absolute local filesystem paths (for example `/home/...` or `/Users/...`). Use only project-scoped paths from the allowed list.
+
 - IMPORTANT: When you need to refer to other core abstractions covered in other chapters, ALWAYS use proper Markdown links like this: [Chapter Title](filename.md). Use the Complete Tutorial Structure above to find the correct filename and the chapter title{link_lang_note}. Translate the surrounding text.
 
 - Use mermaid diagrams to illustrate complex concepts (```mermaid``` format). {mermaid_lang_note}.
@@ -921,13 +974,36 @@ Now, directly provide a super beginner-friendly Markdown output (DON'T need ```m
             else:  # Otherwise, prepend it
                 chapter_content = f"{actual_heading}\n\n{chapter_content}"
 
+        cited_indices = extract_reference_indices(chapter_content)
+        allowed_ref_map = {
+            ref_item["index"]: ref_item for ref_item in chapter_reference_allowlist
+        }
+        invalid_indices = [idx for idx in cited_indices if idx not in allowed_ref_map]
+        if invalid_indices:
+            raise ValueError(
+                f"Chapter {chapter_num} cited invalid ref indices: {invalid_indices}. "
+                f"Allowed: {sorted(allowed_ref_map.keys())}"
+            )
+        if min_required_refs > 0 and len(cited_indices) < min_required_refs:
+            raise ValueError(
+                f"Chapter {chapter_num} has {len(cited_indices)} citations, "
+                f"but needs at least {min_required_refs}."
+            )
+
+        referenced_files = [allowed_ref_map[idx] for idx in cited_indices]
+        if min_required_refs == 0:
+            chapter_content = re.sub(r"\[ref:\d+\]", "", chapter_content)
+
         # Add the generated content to our temporary list for the next iteration's context
         self.chapters_written_so_far.append(chapter_content)
 
-        return chapter_content  # Return the Markdown string (potentially translated)
+        return {
+            "content": chapter_content,
+            "references": referenced_files,
+        }
 
     def post(self, shared, prep_res, exec_res_list):
-        # exec_res_list contains the generated Markdown for each chapter, in order
+        # exec_res_list contains generated chapter payloads, in order
         shared["chapters"] = exec_res_list
         # Clean up the temporary instance variable
         del self.chapters_written_so_far
@@ -939,7 +1015,6 @@ class CombineTutorial(Node):
         project_name = shared["project_name"]
         output_base_dir = shared.get("output_dir", "output")  # Default output dir
         output_path = os.path.join(output_base_dir, project_name)
-        local_dir = shared.get("local_dir")  # Get the local directory path
         # language = shared.get("language", "english") # No longer needed for fixed strings
 
         # Get potentially translated data
@@ -986,8 +1061,7 @@ class CombineTutorial(Node):
         # --- Prepare index.md content ---
         index_content = f"# Tutorial: {project_name}\n\n"
         index_content += f"{relationships_data['summary']}\n\n"  # Use the potentially translated summary directly
-        # Keep fixed strings in English
-        index_content += f"**Source Directory:** `{local_dir}`\n\n"
+        index_content += f"**Source Project:** `{project_name}`\n\n"
 
         # Add Mermaid diagram for relationships (diagram itself uses potentially translated names/labels)
         index_content += "```mermaid\n"
@@ -998,6 +1072,7 @@ class CombineTutorial(Node):
         index_content += f"## Chapters\n\n"
 
         chapter_files = []
+        code_map_lines = []
         # Generate chapter links based on the determined order, using potentially translated names
         for i, abstraction_index in enumerate(chapter_order):
             # Ensure index is valid and we have content for it
@@ -1012,8 +1087,35 @@ class CombineTutorial(Node):
                 filename = f"{i+1:02d}_{safe_name}.md"
                 index_content += f"{i+1}. [{abstraction_name}]({filename})\n"  # Use potentially translated name in link text
 
+                chapter_entry = chapters_content[i]
+                if isinstance(chapter_entry, dict):
+                    chapter_content = chapter_entry.get("content", "")
+                    chapter_references = chapter_entry.get("references", [])
+                else:
+                    chapter_content = chapter_entry
+                    chapter_references = []
+
+                if chapter_references:
+                    chapter_content += "\n\n## Where To Look In Code\n\n"
+                    for ref_item in chapter_references:
+                        chapter_content += (
+                            f"- `{ref_item['display_path']}` (ref:{ref_item['index']})\n"
+                        )
+                    chapter_content += "\n"
+                    code_map_lines.append(
+                        f"- Chapter {i+1} ({abstraction_name}): "
+                        + ", ".join(
+                            f"`{ref_item['display_path']}`"
+                            for ref_item in chapter_references[:5]
+                        )
+                    )
+                else:
+                    chapter_content += (
+                        "\n\n## Where To Look In Code\n\n"
+                        "No direct source files were cited for this chapter.\n\n"
+                    )
+
                 # Add attribution to chapter content (using English fixed string)
-                chapter_content = chapters_content[i]  # Potentially translated content
                 if not chapter_content.endswith("\n\n"):
                     chapter_content += "\n\n"
                 # Keep fixed strings in English
@@ -1025,6 +1127,10 @@ class CombineTutorial(Node):
                 print(
                     f"Warning: Mismatch between chapter order, abstractions, or content at index {i} (abstraction index {abstraction_index}). Skipping file generation for this entry."
                 )
+
+        if code_map_lines:
+            index_content += "\n## Code Map\n\n"
+            index_content += "\n".join(code_map_lines) + "\n"
 
         # Add attribution to index content (using English fixed string)
         index_content += f"\n\n---\n\nGenerated by [AI Codebase Knowledge Builder](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge)"
